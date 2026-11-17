@@ -7,6 +7,7 @@ export class RealtimeClient {
   private peerConnection: RTCPeerConnection | null = null;
   private dataChannel: RTCDataChannel | null = null;
   private stream: MediaStream | null = null;
+  private remoteAudio: HTMLAudioElement | null = null;
   private events: Events;
   constructor(events: Events) { this.events = events; }
 
@@ -19,6 +20,15 @@ export class RealtimeClient {
     try { this.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
     catch { throw new Error("Microphone access was not granted. Allow microphone access in your browser and try again."); }
     const pc = new RTCPeerConnection(); this.peerConnection = pc;
+    pc.addEventListener("track", event => {
+      const [remoteStream] = event.streams;
+      if (!remoteStream) return;
+      const audio = new Audio();
+      audio.autoplay = true;
+      audio.srcObject = remoteStream;
+      this.remoteAudio = audio;
+      void audio.play().catch(() => this.events.onError("Your browser blocked tutor audio. Interact with the page, then start again."));
+    });
     this.stream.getTracks().forEach(track => pc.addTrack(track, this.stream!));
     const channel = pc.createDataChannel("oai-events"); this.dataChannel = channel;
     channel.addEventListener("open", () => this.events.onStatus("Listening"));
@@ -30,7 +40,14 @@ export class RealtimeClient {
     });
     const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
     const response = await fetch("https://api.openai.com/v1/realtime/calls", { method: "POST", headers: { Authorization: `Bearer ${tokenData.clientSecret}`, "Content-Type": "application/sdp" }, body: offer.sdp });
-    if (!response.ok) throw new Error("The voice service could not accept the connection. Please try again.");
+    if (!response.ok) {
+      const details = await response.json().catch(() => null) as { error?: { message?: unknown } } | null;
+      const providerMessage = details?.error?.message;
+      const suffix = typeof providerMessage === "string" && providerMessage.length < 180 ? ` ${providerMessage}` : "";
+      if (response.status === 401 || response.status === 403) throw new Error(`The voice service rejected this session (${response.status}). Confirm that your OpenAI API key has Realtime access and billing enabled.${suffix}`);
+      if (response.status === 429) throw new Error(`The voice service is temporarily rate-limited. Please wait a moment and try again.${suffix}`);
+      throw new Error(`The voice service could not accept the connection (${response.status}).${suffix}`);
+    }
     await pc.setRemoteDescription({ type: "answer", sdp: await response.text() });
   }
 
@@ -40,7 +57,7 @@ export class RealtimeClient {
     this.dataChannel.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
     this.dataChannel.send(JSON.stringify({ type: "response.create", response: { output_modalities: ["audio", "text"] } }));
   }
-  disconnect() { this.dataChannel?.close(); this.peerConnection?.close(); this.stream?.getTracks().forEach(track => track.stop()); this.dataChannel = null; this.peerConnection = null; this.stream = null; this.events.onStatus("Disconnected"); }
+  disconnect() { this.dataChannel?.close(); this.peerConnection?.close(); this.stream?.getTracks().forEach(track => track.stop()); if (this.remoteAudio) { this.remoteAudio.pause(); this.remoteAudio.srcObject = null; } this.dataChannel = null; this.peerConnection = null; this.stream = null; this.remoteAudio = null; this.events.onStatus("Disconnected"); }
   private handleEvent(raw: unknown) {
     try {
       const event = JSON.parse(String(raw)) as { type?: string; transcript?: string; delta?: string; item_id?: string };
