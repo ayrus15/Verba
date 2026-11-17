@@ -2,68 +2,31 @@ import type { LearningSettings } from "./tutorInstructions";
 
 export type TranscriptTurn = { id: string; role: "user" | "assistant"; text: string };
 type Events = { onStatus: (status: string) => void; onError: (message: string) => void; onTranscript: (turn: TranscriptTurn) => void };
+type SessionResponse = { clientSecret?: string; instructions?: string; error?: string };
 
 export class RealtimeClient {
-  private peerConnection: RTCPeerConnection | null = null;
-  private dataChannel: RTCDataChannel | null = null;
-  private stream: MediaStream | null = null;
-  private remoteAudio: HTMLAudioElement | null = null;
-  private events: Events;
-  constructor(events: Events) { this.events = events; }
-
+  private socket: WebSocket | null = null; private stream: MediaStream | null = null; private audioContext: AudioContext | null = null; private processor: ScriptProcessorNode | null = null; private outputTime = 0;
+  constructor(private events: Events) {}
   async connect(settings: LearningSettings) {
-    if (!navigator.mediaDevices?.getUserMedia || !window.RTCPeerConnection) throw new Error("Your browser does not support the microphone features Verba needs. Try a current desktop or mobile browser.");
+    if (!navigator.mediaDevices?.getUserMedia || !window.WebSocket || !window.AudioContext) throw new Error("Your browser does not support the microphone features Verba needs. Try a current desktop or mobile browser.");
     this.events.onStatus("Connecting");
-    const tokenResponse = await fetch("/api/realtime/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(settings) });
-    const tokenData = await tokenResponse.json().catch(() => ({})) as { clientSecret?: string; error?: string };
-    if (!tokenResponse.ok || !tokenData.clientSecret) throw new Error(tokenData.error ?? "We couldn't create a secure voice session.");
-    try { this.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
-    catch { throw new Error("Microphone access was not granted. Allow microphone access in your browser and try again."); }
-    const pc = new RTCPeerConnection(); this.peerConnection = pc;
-    pc.addEventListener("track", event => {
-      const [remoteStream] = event.streams;
-      if (!remoteStream) return;
-      const audio = new Audio();
-      audio.autoplay = true;
-      audio.srcObject = remoteStream;
-      this.remoteAudio = audio;
-      void audio.play().catch(() => this.events.onError("Your browser blocked tutor audio. Interact with the page, then start again."));
-    });
-    this.stream.getTracks().forEach(track => pc.addTrack(track, this.stream!));
-    const channel = pc.createDataChannel("oai-events"); this.dataChannel = channel;
-    channel.addEventListener("open", () => this.events.onStatus("Listening"));
-    channel.addEventListener("message", event => this.handleEvent(event.data));
-    pc.addEventListener("connectionstatechange", () => {
-      if (pc.connectionState === "connected") this.events.onStatus("Listening");
-      if (["failed", "disconnected"].includes(pc.connectionState)) this.events.onError("The voice connection was lost. You can start a new conversation.");
-      if (pc.connectionState === "closed") this.events.onStatus("Disconnected");
-    });
-    const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-    const response = await fetch("https://api.openai.com/v1/realtime/calls", { method: "POST", headers: { Authorization: `Bearer ${tokenData.clientSecret}`, "Content-Type": "application/sdp" }, body: offer.sdp });
-    if (!response.ok) {
-      const details = await response.json().catch(() => null) as { error?: { message?: unknown } } | null;
-      const providerMessage = details?.error?.message;
-      const suffix = typeof providerMessage === "string" && providerMessage.length < 180 ? ` ${providerMessage}` : "";
-      if (response.status === 401 || response.status === 403) throw new Error(`The voice service rejected this session (${response.status}). Confirm that your OpenAI API key has Realtime access and billing enabled.${suffix}`);
-      if (response.status === 429) throw new Error(`The voice service is temporarily rate-limited. Please wait a moment and try again.${suffix}`);
-      throw new Error(`The voice service could not accept the connection (${response.status}).${suffix}`);
-    }
-    await pc.setRemoteDescription({ type: "answer", sdp: await response.text() });
+    const response = await fetch("/api/realtime/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(settings) });
+    const session = await response.json().catch(() => ({})) as SessionResponse;
+    if (!response.ok || !session.clientSecret || !session.instructions) throw new Error(session.error ?? "We couldn't create a secure voice session.");
+    try { this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } }); } catch { throw new Error("Microphone access was not granted. Allow microphone access in your browser and try again."); }
+    this.audioContext = new AudioContext(); await this.audioContext.resume();
+    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(session.clientSecret)}`;
+    const socket = new WebSocket(url); this.socket = socket;
+    socket.addEventListener("open", () => { socket.send(JSON.stringify({ setup: { model: "models/gemini-3.1-flash-live-preview", generationConfig: { responseModalities: ["AUDIO"], speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Aoede" } } } }, systemInstruction: { parts: [{ text: session.instructions }] }, inputAudioTranscription: {}, outputAudioTranscription: {} } })); this.startMicrophone(); this.events.onStatus("Listening"); });
+    socket.addEventListener("message", event => this.handleMessage(event.data));
+    socket.addEventListener("error", () => this.events.onError("The Gemini Live connection failed. Check that your Gemini API key has Live API access, then try again."));
+    socket.addEventListener("close", event => { if (event.code !== 1000 && this.socket) this.events.onError("The voice connection ended unexpectedly. You can start a new conversation."); this.events.onStatus("Disconnected"); });
   }
-
-  sendText(text: string) {
-    if (!this.dataChannel || this.dataChannel.readyState !== "open") throw new Error("Connect to a conversation before sending a message.");
-    const id = crypto.randomUUID(); this.events.onTranscript({ id, role: "user", text });
-    this.dataChannel.send(JSON.stringify({ type: "conversation.item.create", item: { type: "message", role: "user", content: [{ type: "input_text", text }] } }));
-    this.dataChannel.send(JSON.stringify({ type: "response.create", response: { output_modalities: ["audio", "text"] } }));
-  }
-  disconnect() { this.dataChannel?.close(); this.peerConnection?.close(); this.stream?.getTracks().forEach(track => track.stop()); if (this.remoteAudio) { this.remoteAudio.pause(); this.remoteAudio.srcObject = null; } this.dataChannel = null; this.peerConnection = null; this.stream = null; this.remoteAudio = null; this.events.onStatus("Disconnected"); }
-  private handleEvent(raw: unknown) {
-    try {
-      const event = JSON.parse(String(raw)) as { type?: string; transcript?: string; delta?: string; item_id?: string };
-      if (event.type === "conversation.item.input_audio_transcription.completed" && event.transcript) this.events.onTranscript({ id: event.item_id ?? crypto.randomUUID(), role: "user", text: event.transcript });
-      if (event.type === "response.output_audio_transcript.done" && event.transcript) this.events.onTranscript({ id: event.item_id ?? crypto.randomUUID(), role: "assistant", text: event.transcript });
-      if (event.type === "error") this.events.onError("The voice service reported a problem. Please end the conversation and try again.");
-    } catch { /* Ignore non-JSON channel messages. */ }
-  }
+  sendText(text: string) { if (!this.socket || this.socket.readyState !== WebSocket.OPEN) throw new Error("Connect to a conversation before sending a message."); this.events.onTranscript({ id: crypto.randomUUID(), role: "user", text }); this.socket.send(JSON.stringify({ clientContent: { turns: [{ role: "user", parts: [{ text }] }], turnComplete: true } })); }
+  disconnect() { this.processor?.disconnect(); this.stream?.getTracks().forEach(track => track.stop()); this.socket?.close(1000); void this.audioContext?.close(); this.processor = null; this.stream = null; this.socket = null; this.audioContext = null; this.events.onStatus("Disconnected"); }
+  private startMicrophone() { if (!this.audioContext || !this.stream) return; const source = this.audioContext.createMediaStreamSource(this.stream); const processor = this.audioContext.createScriptProcessor(4096, 1, 1); this.processor = processor; processor.onaudioprocess = event => { if (!this.socket || this.socket.readyState !== WebSocket.OPEN) return; const pcm = downsampleToPcm(event.inputBuffer.getChannelData(0), this.audioContext!.sampleRate, 16000); this.socket.send(JSON.stringify({ realtimeInput: { mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: toBase64(pcm.buffer) }] } })); }; source.connect(processor); processor.connect(this.audioContext.destination); }
+  private handleMessage(raw: unknown) { try { const message = JSON.parse(String(raw)) as { serverContent?: { inputTranscription?: { text?: string }; outputTranscription?: { text?: string }; modelTurn?: { parts?: Array<{ inlineData?: { data?: string; mimeType?: string } }> } } }; const content = message.serverContent; if (!content) return; if (content.inputTranscription?.text) this.events.onTranscript({ id: crypto.randomUUID(), role: "user", text: content.inputTranscription.text }); if (content.outputTranscription?.text) this.events.onTranscript({ id: crypto.randomUUID(), role: "assistant", text: content.outputTranscription.text }); content.modelTurn?.parts?.forEach(part => { if (part.inlineData?.data && part.inlineData.mimeType?.includes("audio/pcm")) this.playPcm(part.inlineData.data); }); } catch { /* Ignore malformed provider events. */ } }
+  private playPcm(base64: string) { if (!this.audioContext) return; const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0)); const samples = new Int16Array(bytes.buffer); const buffer = this.audioContext.createBuffer(1, samples.length, 24000); const channel = buffer.getChannelData(0); for (let index = 0; index < samples.length; index++) channel[index] = samples[index] / 32768; const source = this.audioContext.createBufferSource(); source.buffer = buffer; source.connect(this.audioContext.destination); this.outputTime = Math.max(this.outputTime, this.audioContext.currentTime); source.start(this.outputTime); this.outputTime += buffer.duration; }
 }
+function downsampleToPcm(input: Float32Array, inputRate: number, outputRate: number) { const ratio = inputRate / outputRate; const output = new Int16Array(Math.round(input.length / ratio)); for (let index = 0; index < output.length; index++) output[index] = Math.max(-1, Math.min(1, input[Math.floor(index * ratio)] ?? 0)) * 0x7fff; return output; }
+function toBase64(buffer: ArrayBuffer) { let binary = ""; new Uint8Array(buffer).forEach(byte => { binary += String.fromCharCode(byte); }); return btoa(binary); }
